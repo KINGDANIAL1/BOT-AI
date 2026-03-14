@@ -18,8 +18,9 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-# -------------------- استيراد OpenAI --------------------
-import openai
+# -------------------- استيراد OpenAI (الإصدار 1.x) --------------------
+from openai import AsyncOpenAI
+from openai import APIError, AuthenticationError, RateLimitError
 
 # -------------------- محاولة استيراد مكتبات تحليل الملفات --------------------
 try:
@@ -67,9 +68,10 @@ if not ADMIN_ID:
 
 # إعداد OpenAI إذا وُجد المفتاح
 if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     AI_AVAILABLE = True
 else:
+    openai_client = None
     AI_AVAILABLE = False
     logger.warning("OPENAI_API_KEY غير موجود، تعطيل الذكاء الاصطناعي")
 
@@ -252,10 +254,10 @@ async def extract_text_from_txt(file_bytes: bytes) -> str:
         logger.error(f"TXT extraction failed: {e}")
         return ""
 
-# -------------------- دوال الذكاء الاصطناعي --------------------
+# -------------------- دوال الذكاء الاصطناعي (OpenAI v1.x) --------------------
 async def get_ai_response(chat_id: int, user_message: str) -> str:
-    """استدعاء OpenAI API مع مهلة زمنية وتسجيل أفضل للأخطاء."""
-    if not AI_AVAILABLE:
+    """استدعاء OpenAI API (الإصدار 1.x) مع مهلة زمنية وتسجيل أفضل للأخطاء."""
+    if not AI_AVAILABLE or openai_client is None:
         return "عذراً، الذكاء الاصطناعي غير مفعل حالياً."
 
     # حفظ رسالة المستخدم
@@ -267,7 +269,7 @@ async def get_ai_response(chat_id: int, user_message: str) -> str:
     try:
         # استخدام asyncio.wait_for لتحديد مهلة زمنية (مثلاً 30 ثانية)
         response = await asyncio.wait_for(
-            openai.ChatCompletion.acreate(
+            openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=history,
                 max_tokens=500,
@@ -284,15 +286,15 @@ async def get_ai_response(chat_id: int, user_message: str) -> str:
         logger.error(f"OpenAI API timeout for user {chat_id}")
         return "الرد استغرق وقتاً طويلاً، حاول مرة أخرى لاحقاً."
 
-    except openai.error.AuthenticationError:
+    except AuthenticationError:
         logger.error("OpenAI API key is invalid or expired.")
         return "خطأ في المصادقة مع الذكاء الاصطناعي. تواصل مع الإدمن."
 
-    except openai.error.RateLimitError:
+    except RateLimitError:
         logger.error("OpenAI API rate limit exceeded or insufficient quota.")
         return "تم تجاوز حد الاستخدام للذكاء الاصطناعي. حاول لاحقاً."
 
-    except openai.error.APIError as e:
+    except APIError as e:
         logger.error(f"OpenAI API error: {e}")
         return "حدث خطأ في الذكاء الاصطناعي. حاول لاحقاً."
 
@@ -375,13 +377,13 @@ async def test_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """أمر لاختبار الاتصال بالذكاء الاصطناعي (للإدمن فقط)."""
     if update.effective_user.id != ADMIN_ID:
         return
-    if not AI_AVAILABLE:
+    if not AI_AVAILABLE or openai_client is None:
         await update.message.reply_text("الذكاء الاصطناعي غير مفعل.")
         return
     try:
         await update.message.reply_text("جاري اختبار الاتصال...")
         response = await asyncio.wait_for(
-            openai.ChatCompletion.acreate(
+            openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": "قل: البوت يعمل بشكل جيد"}],
                 max_tokens=10
@@ -663,6 +665,7 @@ def main():
     asyncio.set_event_loop(loop)
     loop.run_until_complete(init_db())
 
+    # بناء التطبيق مع drop_pending_updates=True لمنع أي تحديثات عالقة
     app = Application.builder().token(BOT_TOKEN).build()
 
     # الأوامر الأساسية
@@ -692,7 +695,9 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.REPLY & filters.User(user_id=ADMIN_ID), admin_reply_to_user))
 
     app.add_error_handler(error_handler)
-    app.run_polling()
+
+    # بدء البوت مع تجاهل التحديثات القديمة
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
