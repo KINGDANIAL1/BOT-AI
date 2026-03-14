@@ -4,12 +4,11 @@
 import os
 import logging
 import asyncio
-import re
-from datetime import datetime
 import io
+from datetime import datetime
 
 import aiosqlite
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -19,6 +18,9 @@ from telegram.ext import (
     ConversationHandler,
 )
 
+# -------------------- استيراد OpenAI --------------------
+import openai
+
 # -------------------- محاولة استيراد مكتبات تحليل الملفات --------------------
 try:
     import pytesseract
@@ -26,30 +28,24 @@ try:
     OCR_AVAILABLE = True
 except ImportError:
     OCR_AVAILABLE = False
-    logging.warning("pytesseract غير مثبت، تعطيل OCR")
 
 try:
     import PyPDF2
     PDF_AVAILABLE = True
 except ImportError:
     PDF_AVAILABLE = False
-    logging.warning("PyPDF2 غير مثبت، تعطيل قراءة PDF")
 
 try:
     from docx import Document
     DOCX_AVAILABLE = True
 except ImportError:
     DOCX_AVAILABLE = False
-    logging.warning("python-docx غير مثبت، تعطيل قراءة Word")
 
 try:
     import openpyxl
     XLSX_AVAILABLE = True
 except ImportError:
     XLSX_AVAILABLE = False
-    logging.warning("openpyxl غير مثبت، تعطيل قراءة Excel")
-
-ENABLE_FILE_ANALYSIS = os.environ.get("ENABLE_FILE_ANALYSIS", "true").lower() == "true"
 
 # -------------------- الإعدادات الأساسية --------------------
 logging.basicConfig(
@@ -60,14 +56,30 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # غير مستخدم حالياً
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+ENABLE_FILE_ANALYSIS = os.environ.get("ENABLE_FILE_ANALYSIS", "true").lower() == "true"
+
+# التحقق من المتغيرات الإلزامية
+if not BOT_TOKEN:
+    raise ValueError("يجب تعيين BOT_TOKEN")
+if not ADMIN_ID:
+    raise ValueError("يجب تعيين ADMIN_ID")
+
+# إعداد OpenAI إذا وُجد المفتاح
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+    AI_AVAILABLE = True
+else:
+    AI_AVAILABLE = False
+    logger.warning("OPENAI_API_KEY غير موجود، تعطيل الذكاء الاصطناعي")
 
 DB_PATH = "bot_database.db"
 
 # -------------------- دوال قاعدة البيانات --------------------
 async def init_db():
-    """إنشاء جدول المستخدمين إذا لم يكن موجوداً."""
+    """إنشاء الجداول المطلوبة."""
     async with aiosqlite.connect(DB_PATH) as db:
+        # جدول المستخدمين
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 chat_id INTEGER PRIMARY KEY,
@@ -76,15 +88,95 @@ async def init_db():
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # جدول حالات المستخدمين (وضع المحادثة)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_states (
+                chat_id INTEGER PRIMARY KEY,
+                mode TEXT DEFAULT 'ai',  -- 'ai' أو 'admin'
+                FOREIGN KEY (chat_id) REFERENCES users(chat_id)
+            )
+        """)
+        # جدول سجل المحادثات مع الذكاء الاصطناعي (لتذكر السياق)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                role TEXT,  -- 'user' أو 'assistant'
+                content TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
 
 async def add_user(chat_id: int, username: str, first_name: str):
-    """إضافة مستخدم جديد (تجاهل إذا كان موجوداً)."""
+    """إضافة مستخدم جديد مع الحالة الافتراضية (ai إذا كان متاحاً)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR IGNORE INTO users (chat_id, username, first_name) VALUES (?, ?, ?)",
             (chat_id, username, first_name),
         )
+        # تعيين الحالة الافتراضية إذا لم تكن موجودة
+        default_mode = 'ai' if AI_AVAILABLE else 'admin'
+        await db.execute(
+            "INSERT OR IGNORE INTO user_states (chat_id, mode) VALUES (?, ?)",
+            (chat_id, default_mode),
+        )
+        await db.commit()
+
+async def get_user_mode(chat_id: int) -> str:
+    """استرجاع وضع المستخدم الحالي (ai/admin)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT mode FROM user_states WHERE chat_id = ?", (chat_id,))
+        row = await cursor.fetchone()
+        if row:
+            return row[0]
+        # إذا لم يوجد، نضيفه بالوضع الافتراضي
+        default = 'ai' if AI_AVAILABLE else 'admin'
+        await db.execute("INSERT INTO user_states (chat_id, mode) VALUES (?, ?)", (chat_id, default))
+        await db.commit()
+        return default
+
+async def set_user_mode(chat_id: int, mode: str):
+    """تغيير وضع المستخدم."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE user_states SET mode = ? WHERE chat_id = ?", (mode, chat_id))
+        await db.commit()
+
+async def save_chat_message(chat_id: int, role: str, content: str):
+    """حفظ رسالة في سجل المحادثة (للذكاء الاصطناعي)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO chat_history (chat_id, role, content) VALUES (?, ?, ?)",
+            (chat_id, role, content),
+        )
+        # حذف الرسائل القديمة (الاحتفاظ بآخر 10)
+        await db.execute("""
+            DELETE FROM chat_history
+            WHERE id IN (
+                SELECT id FROM chat_history
+                WHERE chat_id = ?
+                ORDER BY timestamp DESC
+                LIMIT -1 OFFSET 20
+            )
+        """, (chat_id,))
+        await db.commit()
+
+async def get_chat_history(chat_id: int, limit: int = 10) -> list:
+    """استرجاع آخر محادثات المستخدم."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT role, content FROM chat_history
+            WHERE chat_id = ?
+            ORDER BY timestamp ASC
+            LIMIT ?
+        """, (chat_id, limit))
+        rows = await cursor.fetchall()
+        return [{"role": row[0], "content": row[1]} for row in rows]
+
+async def clear_chat_history(chat_id: int):
+    """مسح سجل المحادثة."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM chat_history WHERE chat_id = ?", (chat_id,))
         await db.commit()
 
 async def get_all_users() -> list:
@@ -103,19 +195,17 @@ async def get_user_count() -> int:
 
 # -------------------- دوال تحليل الملفات --------------------
 async def extract_text_from_image(file_bytes: bytes) -> str:
-    """استخراج النص من الصورة باستخدام Tesseract."""
     if not OCR_AVAILABLE or not ENABLE_FILE_ANALYSIS:
         return ""
     try:
         image = Image.open(io.BytesIO(file_bytes))
-        text = pytesseract.image_to_string(image, lang='ara+eng')  # يدعم العربية والإنجليزية
+        text = pytesseract.image_to_string(image, lang='ara+eng')
         return text.strip()
     except Exception as e:
         logger.error(f"OCR فشل: {e}")
         return ""
 
 async def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """استخراج النص من PDF."""
     if not PDF_AVAILABLE or not ENABLE_FILE_ANALYSIS:
         return ""
     try:
@@ -129,7 +219,6 @@ async def extract_text_from_pdf(file_bytes: bytes) -> str:
         return ""
 
 async def extract_text_from_docx(file_bytes: bytes) -> str:
-    """استخراج النص من ملف Word."""
     if not DOCX_AVAILABLE or not ENABLE_FILE_ANALYSIS:
         return ""
     try:
@@ -141,7 +230,6 @@ async def extract_text_from_docx(file_bytes: bytes) -> str:
         return ""
 
 async def extract_text_from_xlsx(file_bytes: bytes) -> str:
-    """استخراج النص من ملف Excel."""
     if not XLSX_AVAILABLE or not ENABLE_FILE_ANALYSIS:
         return ""
     try:
@@ -158,120 +246,212 @@ async def extract_text_from_xlsx(file_bytes: bytes) -> str:
         return ""
 
 async def extract_text_from_txt(file_bytes: bytes) -> str:
-    """قراءة ملف نصي."""
     try:
         return file_bytes.decode('utf-8', errors='ignore').strip()
     except Exception as e:
         logger.error(f"TXT extraction failed: {e}")
         return ""
 
-# -------------------- دوال البوت --------------------
+# -------------------- دوال الذكاء الاصطناعي --------------------
+async def get_ai_response(chat_id: int, user_message: str) -> str:
+    """استدعاء OpenAI API مع الحفاظ على سياق المحادثة."""
+    if not AI_AVAILABLE:
+        return "عذراً، الذكاء الاصطناعي غير مفعل حالياً."
+
+    # حفظ رسالة المستخدم
+    await save_chat_message(chat_id, "user", user_message)
+
+    # استرجاع آخر 10 رسائل
+    history = await get_chat_history(chat_id, 10)
+
+    try:
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-3.5-turbo",
+            messages=history,
+            max_tokens=500,
+            temperature=0.7,
+        )
+        reply = response.choices[0].message.content.strip()
+        # حفظ رد الذكاء الاصطناعي
+        await save_chat_message(chat_id, "assistant", reply)
+        return reply
+    except Exception as e:
+        logger.error(f"OpenAI API error: {e}")
+        return "حدث خطأ في الاتصال بالذكاء الاصطناعي. حاول لاحقاً."
+
+# -------------------- أوامر البوت --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """رسالة الترحيب وتسجيل المستخدم."""
     user = update.effective_user
     chat_id = user.id
     username = user.username
     first_name = user.first_name
 
     await add_user(chat_id, username, first_name)
-    await update.message.reply_text(
+    await clear_chat_history(chat_id)  # بداية جديدة
+
+    welcome_text = (
         f"مرحباً {first_name}!\n"
-        "أنا بوت خدمة العملة. يمكنك إرسال رسالتك وسيتم تحويلها إلى الإدمن مع تحليل الصور والملفات إن أمكن."
+        "أنا بوت ذكي يمكنك التحدث معي باستخدام الذكاء الاصطناعي.\n"
     )
+    if AI_AVAILABLE:
+        welcome_text += "يمكنك التحدث معي مباشرة، وإذا أردت التحدث مع إدمن بشري أرسل 'بشري' أو استخدم /admin.\n"
+    else:
+        welcome_text += "سيتم تحويل رسائلك إلى الإدمن البشري.\n"
+    welcome_text += "للعودة للذكاء الاصطناعي أرسل 'ذكاء اصطناعي' أو استخدم /ai."
+
+    await update.message.reply_text(welcome_text)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """مساعدة عامة."""
-    await update.message.reply_text(
+    help_text = (
         "الأوامر المتاحة:\n"
         "/start - بدء المحادثة\n"
-        "/help - هذه المساعدة\n\n"
-        "للمستخدمين: أرسل رسالتك وسيتم تحويلها للإدمن.\n"
-        "للإدمن: استخدم /panel للإحصائيات، /broadcast للإذاعة."
+        "/help - هذه المساعدة\n"
+        "/mode - معرفة وضعك الحالي\n"
+        "/admin - التحويل إلى إدمن بشري\n"
+        "/ai - العودة إلى الذكاء الاصطناعي (إذا كان مفعلاً)\n\n"
+        "للإدمن فقط:\n"
+        "/panel - لوحة المعلومات\n"
+        "/broadcast - إذاعة رسالة للمستخدمين"
     )
+    await update.message.reply_text(help_text)
 
-# -------------------- لوحة معلومات الإدمن --------------------
+async def show_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_user.id
+    mode = await get_user_mode(chat_id)
+    mode_text = "ذكاء اصطناعي" if mode == 'ai' else "إدمن بشري"
+    await update.message.reply_text(f"وضعك الحالي: {mode_text}")
+
+async def switch_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_user.id
+    await set_user_mode(chat_id, 'admin')
+    await update.message.reply_text("تم التحويل إلى الإدمن البشري. سيتم إرسال رسائلك للإدمن.")
+
+async def switch_to_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not AI_AVAILABLE:
+        await update.message.reply_text("الذكاء الاصطناعي غير مفعل حالياً.")
+        return
+    chat_id = update.effective_user.id
+    await set_user_mode(chat_id, 'ai')
+    await clear_chat_history(chat_id)  # بداية محادثة جديدة
+    await update.message.reply_text("تم العودة إلى الذكاء الاصطناعي. يمكنك التحدث معي الآن.")
+
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """عرض إحصائيات البوت (للإدمن فقط)."""
     if update.effective_user.id != ADMIN_ID:
         return
     count = await get_user_count()
+    ai_status = "مفعل ✅" if AI_AVAILABLE else "غير مفعل ❌"
     await update.message.reply_text(
         f"📊 لوحة المعلومات:\n"
         f"إجمالي المستخدمين: {count}\n"
         f"معرف الإدمن: {ADMIN_ID}\n"
-        f"حالة البوت: نشط ✅\n"
-        f"تحليل الملفات: {'مفعل' if ENABLE_FILE_ANALYSIS else 'معطل'}"
+        f"الذكاء الاصطناعي: {ai_status}\n"
+        f"تحليل الملفات: {'مفعل' if ENABLE_FILE_ANALYSIS else 'معطل'}\n"
+        f"حالة البوت: نشط ✅"
     )
 
-# -------------------- استقبال رسائل المستخدمين وتحويلها للإدمن مع تحليل الملفات --------------------
-async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أي رسالة من مستخدم عادي تُعاد توجيهها للإدمن مع محتوى إضافي مستخلص من الملفات."""
+# -------------------- معالج الرسائل حسب الوضع --------------------
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج رئيسي للرسائل الخاصة."""
     user = update.effective_user
     chat_id = user.id
 
+    # تسجيل المستخدم إن لم يكن مسجلاً
     await add_user(chat_id, user.username, user.first_name)
 
     message = update.message
-    caption_parts = [f"رسالة من @{user.username or 'لا يوجد يوزر'} (ID: {chat_id}):"]
+    text = message.text or message.caption or ""
 
-    # تحديد نوع الوسائط واستخراج النص إن أمكن
+    # التحقق من كلمات التحويل السريع
+    if text.strip() in ["بشري", "ادمن", "إدمن", "بشري", "/admin"]:
+        await switch_to_admin(update, context)
+        return
+    elif text.strip() in ["ذكاء اصطناعي", "ai", "/ai"] and AI_AVAILABLE:
+        await switch_to_ai(update, context)
+        return
+
+    # استرجاع وضع المستخدم
+    mode = await get_user_mode(chat_id)
+
+    if mode == 'ai' and AI_AVAILABLE:
+        # وضع الذكاء الاصطناعي
+        await update.message.reply_chat_action("typing")
+        # إذا كان هناك ملف، نستخرج نصه ونرسله مع الرسالة
+        extracted = ""
+        if message.photo and ENABLE_FILE_ANALYSIS:
+            photo_file = await message.photo[-1].get_file()
+            file_bytes = await photo_file.download_as_bytearray()
+            extracted = await extract_text_from_image(bytes(file_bytes))
+        elif message.document and ENABLE_FILE_ANALYSIS:
+            doc_file = await message.document.get_file()
+            file_bytes = await doc_file.download_as_bytearray()
+            file_bytes = bytes(file_bytes)
+            mime = message.document.mime_type or ""
+            name = message.document.file_name or ""
+            if mime == "application/pdf" or name.endswith('.pdf'):
+                extracted = await extract_text_from_pdf(file_bytes)
+            elif "word" in mime or name.endswith(('.docx', '.doc')):
+                extracted = await extract_text_from_docx(file_bytes)
+            elif "excel" in mime or "spreadsheet" in mime or name.endswith(('.xlsx', '.xls')):
+                extracted = await extract_text_from_xlsx(file_bytes)
+            elif mime.startswith("text/") or name.endswith('.txt'):
+                extracted = await extract_text_from_txt(file_bytes)
+
+        if extracted:
+            user_message = f"المستخدم قال: {text}\nمحتوى الملف المرفق:\n{extracted}"
+        else:
+            user_message = text
+
+        # الحصول على رد الذكاء الاصطناعي
+        reply = await get_ai_response(chat_id, user_message)
+        await update.message.reply_text(reply)
+
+    else:
+        # وضع الإدمن البشري: تحويل الرسالة للإدمن مع تحليل الملفات (مثل السابق)
+        await handle_user_message(update, context)
+
+# -------------------- تحويل الرسائل للإدمن (نسخة معدلة) --------------------
+async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تحويل رسالة المستخدم للإدمن مع تحليل الملفات."""
+    user = update.effective_user
+    chat_id = user.id
+    message = update.message
+
+    caption_parts = [f"رسالة من @{user.username or 'لا يوجد يوزر'} (ID: {chat_id}):"]
     extracted_text = ""
-    file_type = ""
 
     if message.photo:
-        # الصورة: نقوم بتحميلها واستخراج النص عبر OCR
         photo_file = await message.photo[-1].get_file()
         file_bytes = await photo_file.download_as_bytearray()
         if ENABLE_FILE_ANALYSIS and OCR_AVAILABLE:
             extracted_text = await extract_text_from_image(bytes(file_bytes))
-        caption_parts.append(f"[صورة]")
-        file_type = "photo"
-
+        caption_parts.append("[صورة]")
     elif message.document:
         doc = message.document
-        mime_type = doc.mime_type or ""
-        file_name = doc.file_name or ""
-        caption_parts.append(f"[مستند: {file_name}]")
-
-        # تحميل الملف
+        caption_parts.append(f"[مستند: {doc.file_name}]")
         doc_file = await doc.get_file()
         file_bytes = await doc_file.download_as_bytearray()
         file_bytes = bytes(file_bytes)
-
         if ENABLE_FILE_ANALYSIS:
-            if mime_type == "application/pdf" or file_name.lower().endswith('.pdf'):
+            mime = doc.mime_type or ""
+            name = doc.file_name or ""
+            if mime == "application/pdf" or name.endswith('.pdf'):
                 extracted_text = await extract_text_from_pdf(file_bytes)
-                file_type = "PDF"
-            elif mime_type in ["application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/msword"] or file_name.lower().endswith(('.docx', '.doc')):
+            elif "word" in mime or name.endswith(('.docx', '.doc')):
                 extracted_text = await extract_text_from_docx(file_bytes)
-                file_type = "Word"
-            elif mime_type in ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/vnd.ms-excel"] or file_name.lower().endswith(('.xlsx', '.xls')):
+            elif "excel" in mime or "spreadsheet" in mime or name.endswith(('.xlsx', '.xls')):
                 extracted_text = await extract_text_from_xlsx(file_bytes)
-                file_type = "Excel"
-            elif mime_type.startswith("text/") or file_name.lower().endswith('.txt'):
+            elif mime.startswith("text/") or name.endswith('.txt'):
                 extracted_text = await extract_text_from_txt(file_bytes)
-                file_type = "نص"
-            else:
-                extracted_text = ""  # نوع غير مدعوم
-        else:
-            extracted_text = ""
-
     elif message.video:
         caption_parts.append("[فيديو]")
-        file_type = "video"
     elif message.audio:
         caption_parts.append("[صوت]")
-        file_type = "audio"
     elif message.voice:
         caption_parts.append("[رسالة صوتية]")
-        file_type = "voice"
-    else:  # رسالة نصية
+    else:
         caption_parts.append(message.text or "")
-        file_type = "text"
 
-    # إضافة النص المستخرج إن وجد
     if extracted_text:
-        # تحديد طول معقول (4000 حرف) لتجنب تجاوز حد التيليغرام
         if len(extracted_text) > 4000:
             extracted_text = extracted_text[:4000] + "\n... (اقتطاع)"
         caption_parts.append(f"\n📄 محتوى الملف المستخلص:\n{extracted_text}")
@@ -279,12 +459,11 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     caption = "\n".join(caption_parts)
 
     try:
-        # إرسال الرسالة إلى الإدمن حسب نوعها
         if message.photo:
             sent = await context.bot.send_photo(
                 chat_id=ADMIN_ID,
                 photo=message.photo[-1].file_id,
-                caption=caption[:1024]  # حد الكابشن للصورة
+                caption=caption[:1024]
             )
         elif message.video:
             sent = await context.bot.send_video(
@@ -308,160 +487,118 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             sent = await context.bot.send_voice(
                 chat_id=ADMIN_ID,
                 voice=message.voice.file_id,
-                caption=caption[:200]  # حد الكابشن للصوت
+                caption=caption[:200]
             )
-        else:  # نص
+        else:
             sent = await context.bot.send_message(chat_id=ADMIN_ID, text=caption)
 
-        # تخزين مرجع الرسالة
+        # تخزين مرجع للرد
         context.bot_data.setdefault("forwarded_messages", {})[sent.message_id] = chat_id
-
+        await update.message.reply_text("✅ تم إرسال رسالتك إلى الإدمن، سيرد عليك قريباً.")
     except Exception as e:
-        logger.error(f"فشل إعادة توجيه رسالة المستخدم {chat_id}: {e}")
-        await update.message.reply_text("عذراً، حدث خطأ في إرسال رسالتك. حاول لاحقاً.")
-        return
+        logger.error(f"فشل إعادة التوجيه: {e}")
+        await update.message.reply_text("عذراً، حدث خطأ في الإرسال.")
 
-    # تأكيد للمستخدم
-    await update.message.reply_text("✅ تم إرسال رسالتك إلى الإدمن، سيرد عليك قريباً.")
-
-# -------------------- رد الإدمن على مستخدم معين --------------------
+# -------------------- رد الإدمن على المستخدم --------------------
 async def admin_reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """عندما يرد الإدمن على رسالة مُعاد توجيهها، نرسل الرد إلى المستخدم الأصلي."""
     if update.effective_user.id != ADMIN_ID:
         return
-
     replied = update.message.reply_to_message
     if not replied:
         await update.message.reply_text("الرجاء الرد على رسالة مُعاد توجيهها.")
         return
-
     msg_id = replied.message_id
     user_id = context.bot_data.get("forwarded_messages", {}).get(msg_id)
-
     if not user_id:
-        await update.message.reply_text("لا يمكن العثور على المستخدم. قد تكون الرسالة قديمة.")
+        await update.message.reply_text("لا يمكن العثور على المستخدم.")
         return
-
     reply_text = update.message.text
     try:
         await context.bot.send_message(
             chat_id=user_id,
             text=f"📨 رد من الإدمن:\n{reply_text}"
         )
-        await update.message.reply_text("✅ تم إرسال الرد بنجاح.")
+        await update.message.reply_text("✅ تم إرسال الرد.")
     except Exception as e:
-        logger.error(f"فشل إرسال الرد للمستخدم {user_id}: {e}")
-        await update.message.reply_text("❌ فشل الإرسال. قد يكون المستخدم أوقف البوت.")
+        logger.error(f"فشل إرسال الرد: {e}")
+        await update.message.reply_text("❌ فشل الإرسال.")
 
-# -------------------- الإذاعة (للإدمن) --------------------
+# -------------------- الإذاعة (مثل السابق) --------------------
 BROADCAST_MSG, BROADCAST_CONFIRM = range(2)
 
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بدء عملية الإذاعة."""
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-    await update.message.reply_text("📢 أرسل الرسالة التي تريد إذاعتها (نص، صورة، فيديو...).")
+    await update.message.reply_text("📢 أرسل الرسالة التي تريد إذاعتها.")
     return BROADCAST_MSG
 
 async def broadcast_receive_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """استلام محتوى الإذاعة."""
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
     context.user_data["broadcast_msg"] = update.message
-    await update.message.reply_text("هل أنت متأكد؟ (أرسل 'نعم' للتأكيد أو 'لا' للإلغاء)")
+    await update.message.reply_text("هل أنت متأكد؟ (نعم/لا)")
     return BROADCAST_CONFIRM
 
 async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تأكيد الإذاعة وإرسالها لكل المستخدمين."""
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
     text = update.message.text
     if text.lower() not in ["نعم", "yes", "y"]:
-        await update.message.reply_text("تم إلغاء الإذاعة.")
+        await update.message.reply_text("تم الإلغاء.")
         return ConversationHandler.END
-
     msg = context.user_data.get("broadcast_msg")
     if not msg:
-        await update.message.reply_text("حدث خطأ. أعد المحاولة.")
+        await update.message.reply_text("خطأ.")
         return ConversationHandler.END
-
     users = await get_all_users()
-    total = len(users)
-    success = 0
-    fail = 0
-
-    await update.message.reply_text(f"🚀 بدء الإذاعة لـ {total} مستخدم...")
-
+    success = fail = 0
+    await update.message.reply_text(f"🚀 بدء الإذاعة لـ {len(users)} مستخدم...")
     for chat_id in users:
         try:
             if msg.text:
                 await context.bot.send_message(chat_id=chat_id, text=msg.text)
             elif msg.photo:
-                await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=msg.photo[-1].file_id,
-                    caption=msg.caption
-                )
+                await context.bot.send_photo(chat_id=chat_id, photo=msg.photo[-1].file_id, caption=msg.caption)
             elif msg.video:
-                await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=msg.video.file_id,
-                    caption=msg.caption
-                )
+                await context.bot.send_video(chat_id=chat_id, video=msg.video.file_id, caption=msg.caption)
             elif msg.document:
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=msg.document.file_id,
-                    caption=msg.caption
-                )
+                await context.bot.send_document(chat_id=chat_id, document=msg.document.file_id, caption=msg.caption)
             elif msg.audio:
-                await context.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=msg.audio.file_id,
-                    caption=msg.caption
-                )
+                await context.bot.send_audio(chat_id=chat_id, audio=msg.audio.file_id, caption=msg.caption)
             elif msg.voice:
-                await context.bot.send_voice(
-                    chat_id=chat_id,
-                    voice=msg.voice.file_id,
-                    caption=msg.caption
-                )
-            else:
-                continue
+                await context.bot.send_voice(chat_id=chat_id, voice=msg.voice.file_id, caption=msg.caption)
             success += 1
-        except Exception as e:
-            logger.error(f"فشل الإذاعة للمستخدم {chat_id}: {e}")
+        except Exception:
             fail += 1
         await asyncio.sleep(0.05)
-
-    await update.message.reply_text(f"✅ انتهت الإذاعة. نجح: {success}، فشل: {fail}")
+    await update.message.reply_text(f"✅ تم. نجح: {success}، فشل: {fail}")
     return ConversationHandler.END
 
 async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إلغاء الإذاعة."""
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-    await update.message.reply_text("تم إلغاء الإذاعة.")
+    await update.message.reply_text("تم الإلغاء.")
     return ConversationHandler.END
 
 # -------------------- معالج الأخطاء --------------------
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(msg="حدث خطأ أثناء معالجة التحديث:", exc_info=context.error)
+    logger.error(msg="خطأ:", exc_info=context.error)
 
-# -------------------- تشغيل البوت --------------------
+# -------------------- التشغيل --------------------
 def main():
-    # تهيئة قاعدة البيانات
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(init_db())
 
-    # إنشاء التطبيق
-    application = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    # أوامر بسيطة
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("panel", admin_panel))
+    # الأوامر الأساسية
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("mode", show_mode))
+    app.add_handler(CommandHandler("admin", switch_to_admin))
+    app.add_handler(CommandHandler("ai", switch_to_ai))
+    app.add_handler(CommandHandler("panel", admin_panel))
 
     # محادثة الإذاعة
     broadcast_conv = ConversationHandler(
@@ -472,29 +609,16 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", broadcast_cancel)],
     )
-    application.add_handler(broadcast_conv)
+    app.add_handler(broadcast_conv)
 
-    # استقبال رسائل المستخدمين العاديين (في الخاص) مع تحليل الملفات
-    application.add_handler(
-        MessageHandler(
-            filters.ChatType.PRIVATE & filters.ALL & ~filters.COMMAND,
-            handle_user_message
-        )
-    )
+    # معالج الرسائل الرئيسي (لكل المستخدمين عدا الإدمن في وضع الرد)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_message))
 
-    # رد الإدمن على رسالة مُعاد توجيهها
-    application.add_handler(
-        MessageHandler(
-            filters.ChatType.PRIVATE & filters.REPLY & filters.User(user_id=ADMIN_ID),
-            admin_reply_to_user
-        )
-    )
+    # رد الإدمن على الرسائل المُعاد توجيهها
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.REPLY & filters.User(user_id=ADMIN_ID), admin_reply_to_user))
 
-    # معالج الأخطاء
-    application.add_error_handler(error_handler)
-
-    # بدء البوت
-    application.run_polling()
+    app.add_error_handler(error_handler)
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
