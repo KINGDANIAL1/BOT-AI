@@ -1,0 +1,7 @@
+python-telegram-bot[job-queue]>=20.0
+aiosqlite
+Pillow
+pytesseract
+PyPDF2
+python-docx
+openpyxl
