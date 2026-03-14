@@ -8,7 +8,7 @@ import io
 from datetime import datetime
 
 import aiosqlite
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -149,7 +149,7 @@ async def save_chat_message(chat_id: int, role: str, content: str):
             "INSERT INTO chat_history (chat_id, role, content) VALUES (?, ?, ?)",
             (chat_id, role, content),
         )
-        # حذف الرسائل القديمة (الاحتفاظ بآخر 10)
+        # حذف الرسائل القديمة (الاحتفاظ بآخر 20 رسالة)
         await db.execute("""
             DELETE FROM chat_history
             WHERE id IN (
@@ -254,7 +254,7 @@ async def extract_text_from_txt(file_bytes: bytes) -> str:
 
 # -------------------- دوال الذكاء الاصطناعي --------------------
 async def get_ai_response(chat_id: int, user_message: str) -> str:
-    """استدعاء OpenAI API مع الحفاظ على سياق المحادثة."""
+    """استدعاء OpenAI API مع مهلة زمنية وتسجيل أفضل للأخطاء."""
     if not AI_AVAILABLE:
         return "عذراً، الذكاء الاصطناعي غير مفعل حالياً."
 
@@ -265,19 +265,40 @@ async def get_ai_response(chat_id: int, user_message: str) -> str:
     history = await get_chat_history(chat_id, 10)
 
     try:
-        response = await openai.ChatCompletion.acreate(
-            model="gpt-3.5-turbo",
-            messages=history,
-            max_tokens=500,
-            temperature=0.7,
+        # استخدام asyncio.wait_for لتحديد مهلة زمنية (مثلاً 30 ثانية)
+        response = await asyncio.wait_for(
+            openai.ChatCompletion.acreate(
+                model="gpt-3.5-turbo",
+                messages=history,
+                max_tokens=500,
+                temperature=0.7,
+            ),
+            timeout=30.0
         )
         reply = response.choices[0].message.content.strip()
         # حفظ رد الذكاء الاصطناعي
         await save_chat_message(chat_id, "assistant", reply)
         return reply
-    except Exception as e:
+
+    except asyncio.TimeoutError:
+        logger.error(f"OpenAI API timeout for user {chat_id}")
+        return "الرد استغرق وقتاً طويلاً، حاول مرة أخرى لاحقاً."
+
+    except openai.error.AuthenticationError:
+        logger.error("OpenAI API key is invalid or expired.")
+        return "خطأ في المصادقة مع الذكاء الاصطناعي. تواصل مع الإدمن."
+
+    except openai.error.RateLimitError:
+        logger.error("OpenAI API rate limit exceeded or insufficient quota.")
+        return "تم تجاوز حد الاستخدام للذكاء الاصطناعي. حاول لاحقاً."
+
+    except openai.error.APIError as e:
         logger.error(f"OpenAI API error: {e}")
-        return "حدث خطأ في الاتصال بالذكاء الاصطناعي. حاول لاحقاً."
+        return "حدث خطأ في الذكاء الاصطناعي. حاول لاحقاً."
+
+    except Exception as e:
+        logger.error(f"Unexpected OpenAI error: {e}", exc_info=True)
+        return "حدث خطأ غير متوقع. حاول لاحقاً."
 
 # -------------------- أوامر البوت --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -311,7 +332,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/ai - العودة إلى الذكاء الاصطناعي (إذا كان مفعلاً)\n\n"
         "للإدمن فقط:\n"
         "/panel - لوحة المعلومات\n"
-        "/broadcast - إذاعة رسالة للمستخدمين"
+        "/broadcast - إذاعة رسالة للمستخدمين\n"
+        "/testai - اختبار الاتصال بالذكاء الاصطناعي"
     )
     await update.message.reply_text(help_text)
 
@@ -349,6 +371,28 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"حالة البوت: نشط ✅"
     )
 
+async def test_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر لاختبار الاتصال بالذكاء الاصطناعي (للإدمن فقط)."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not AI_AVAILABLE:
+        await update.message.reply_text("الذكاء الاصطناعي غير مفعل.")
+        return
+    try:
+        await update.message.reply_text("جاري اختبار الاتصال...")
+        response = await asyncio.wait_for(
+            openai.ChatCompletion.acreate(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": "قل: البوت يعمل بشكل جيد"}],
+                max_tokens=10
+            ),
+            timeout=15
+        )
+        reply = response.choices[0].message.content.strip()
+        await update.message.reply_text(f"✅ الذكاء الاصطناعي يعمل:\n{reply}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطأ: {str(e)}")
+
 # -------------------- معالج الرسائل حسب الوضع --------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالج رئيسي للرسائل الخاصة."""
@@ -362,7 +406,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = message.text or message.caption or ""
 
     # التحقق من كلمات التحويل السريع
-    if text.strip() in ["بشري", "ادمن", "إدمن", "بشري", "/admin"]:
+    if text.strip() in ["بشري", "ادمن", "إدمن", "/admin"]:
         await switch_to_admin(update, context)
         return
     elif text.strip() in ["ذكاء اصطناعي", "ai", "/ai"] and AI_AVAILABLE:
@@ -406,11 +450,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
 
     else:
-        # وضع الإدمن البشري: تحويل الرسالة للإدمن مع تحليل الملفات (مثل السابق)
-        await handle_user_message(update, context)
+        # وضع الإدمن البشري: تحويل الرسالة للإدمن مع تحليل الملفات
+        await forward_to_admin(update, context)
 
-# -------------------- تحويل الرسائل للإدمن (نسخة معدلة) --------------------
-async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# -------------------- تحويل الرسائل للإدمن --------------------
+async def forward_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """تحويل رسالة المستخدم للإدمن مع تحليل الملفات."""
     user = update.effective_user
     chat_id = user.id
@@ -523,7 +567,7 @@ async def admin_reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"فشل إرسال الرد: {e}")
         await update.message.reply_text("❌ فشل الإرسال.")
 
-# -------------------- الإذاعة (مثل السابق) --------------------
+# -------------------- الإذاعة --------------------
 BROADCAST_MSG, BROADCAST_CONFIRM = range(2)
 
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -536,7 +580,7 @@ async def broadcast_receive_message(update: Update, context: ContextTypes.DEFAUL
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
     context.user_data["broadcast_msg"] = update.message
-    await update.message.reply_text("هل أنت متأكد؟ (نعم/لا)")
+    await update.message.reply_text("هل أنت متأكد؟ (أرسل 'نعم' للتأكيد أو 'لا' للإلغاء)")
     return BROADCAST_CONFIRM
 
 async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -548,30 +592,59 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     msg = context.user_data.get("broadcast_msg")
     if not msg:
-        await update.message.reply_text("خطأ.")
+        await update.message.reply_text("حدث خطأ. أعد المحاولة.")
         return ConversationHandler.END
+
     users = await get_all_users()
-    success = fail = 0
-    await update.message.reply_text(f"🚀 بدء الإذاعة لـ {len(users)} مستخدم...")
+    total = len(users)
+    success = 0
+    fail = 0
+
+    await update.message.reply_text(f"🚀 بدء الإذاعة لـ {total} مستخدم...")
+
     for chat_id in users:
         try:
             if msg.text:
                 await context.bot.send_message(chat_id=chat_id, text=msg.text)
             elif msg.photo:
-                await context.bot.send_photo(chat_id=chat_id, photo=msg.photo[-1].file_id, caption=msg.caption)
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=msg.photo[-1].file_id,
+                    caption=msg.caption
+                )
             elif msg.video:
-                await context.bot.send_video(chat_id=chat_id, video=msg.video.file_id, caption=msg.caption)
+                await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=msg.video.file_id,
+                    caption=msg.caption
+                )
             elif msg.document:
-                await context.bot.send_document(chat_id=chat_id, document=msg.document.file_id, caption=msg.caption)
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=msg.document.file_id,
+                    caption=msg.caption
+                )
             elif msg.audio:
-                await context.bot.send_audio(chat_id=chat_id, audio=msg.audio.file_id, caption=msg.caption)
+                await context.bot.send_audio(
+                    chat_id=chat_id,
+                    audio=msg.audio.file_id,
+                    caption=msg.caption
+                )
             elif msg.voice:
-                await context.bot.send_voice(chat_id=chat_id, voice=msg.voice.file_id, caption=msg.caption)
+                await context.bot.send_voice(
+                    chat_id=chat_id,
+                    voice=msg.voice.file_id,
+                    caption=msg.caption
+                )
+            else:
+                continue
             success += 1
-        except Exception:
+        except Exception as e:
+            logger.error(f"فشل الإذاعة للمستخدم {chat_id}: {e}")
             fail += 1
         await asyncio.sleep(0.05)
-    await update.message.reply_text(f"✅ تم. نجح: {success}، فشل: {fail}")
+
+    await update.message.reply_text(f"✅ انتهت الإذاعة. نجح: {success}، فشل: {fail}")
     return ConversationHandler.END
 
 async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -582,7 +655,7 @@ async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------------------- معالج الأخطاء --------------------
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(msg="خطأ:", exc_info=context.error)
+    logger.error(msg="حدث خطأ أثناء معالجة التحديث:", exc_info=context.error)
 
 # -------------------- التشغيل --------------------
 def main():
@@ -599,6 +672,7 @@ def main():
     app.add_handler(CommandHandler("admin", switch_to_admin))
     app.add_handler(CommandHandler("ai", switch_to_ai))
     app.add_handler(CommandHandler("panel", admin_panel))
+    app.add_handler(CommandHandler("testai", test_ai))
 
     # محادثة الإذاعة
     broadcast_conv = ConversationHandler(
